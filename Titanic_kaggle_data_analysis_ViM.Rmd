@@ -1,0 +1,270 @@
+---
+title: "R Notebook for Titanic Kaggle data analysis"
+output:
+html_document:
+number_sections: true
+toc: true
+fig_width: 15
+fig_height: 15
+fig_align: centre
+highlight: textmate
+author: Vikram Mitra
+
+---
+
+# Introduction
+
+This is a [R Markdown](http://rmarkdown.rstudio.com) Notebook for analysis of the Titanic dataset.
+
+## Load libraries
+
+```{r,message=FALSE,echo=FALSE}
+rm(list = ls())
+library(data.table)
+library(ggplot2)
+library(ggridges)
+library(cowplot)
+library(h2o)
+library(corrplot)
+library(randomForest)
+library(mice)
+
+h2o.init()
+```
+
+# Read data and creating feature engineering
+After reading the data into the R environment, I created a new variable called **Title**. Cleaned up **Ticket** column and removed any alpha-numeric data. Created Family and Family size variables. Here, as usual family fize was constructed as  $SibSp$ + $Parch$ + $1$ (including the passenger themselves)
+Also created the Survived status column in the test data table before combining the two datasets.
+
+```{r}
+test_df<- fread(input = "input/test.csv")
+test_df$Survived<- NA
+train_df <- fread(input = "input/train.csv")
+
+combined_data<- rbind(test_df,train_df[,colnames(test_df),with=FALSE])
+combined_data$Title<- gsub("\\..*","",gsub(".*\\,","",combined_data$Name))
+combined_data$Ticket<- gsub("[^[:alnum:] ]","",combined_data$Ticket)
+combined_data$Ticket<- as.numeric(gsub("[^0-9\\.]","",combined_data$Ticket))
+
+# Create a family size variable 
+combined_data$Fsize <- combined_data$SibSp + combined_data$Parch + 1
+combined_data$Surname <- gsub("\\,.*","",combined_data$Name)
+# Create a family variable 
+combined_data$Family <- paste(combined_data$Surname, combined_data$Fsize, sep='_')
+
+# Changing the Cabin variable column - claning and creating an imaginary value for 'blank' information
+combined_data[Cabin==""]$Cabin<- "Z"
+combined_data[!is.na(Cabin)]$Cabin<- gsub("[[:digit:]]","",combined_data$Cabin)
+
+```
+# Exploratory analysis and summary statistics
+```{r}
+summary(combined_data)
+```
+
+Summaring the data shows that variables **Age** , **Fare** and Ticket have missing data points. 
+Missing data in these variables can be imputed from other variables.
+However before imputation lets check how the variables are correlated with each other.
+
+# Imputing missing data points 
+```{r}
+
+# converting factor variables to discrete numeric variables
+varibles_to_convert <- c('Sex','Title','Embarked','Cabin')
+combined_data[,(varibles_to_convert):= lapply(.SD, FUN = function(x) as.numeric(as.factor(x))), .SDcols = varibles_to_convert]
+
+colsTouse<- colnames(combined_data)
+colsTouse<-colsTouse[!colsTouse %in% c("Name","Family","Surname")]
+
+corr_matrix <- cor(combined_data[,.SD,.SDcols = colsTouse],use = "complete.obs")
+corrplot(corr_matrix, type = "full",method = "circle",order = "hclust", 
+         tl.col = "black", tl.srt = 45,number.cex = 0.8, 
+         number.digits = 2,col=colorRampPalette(c("blue","white","red"))(200),
+         addCoef.col="black")
+
+```
+
+Since the Fare seems to most correlated to the Survival variable, I use the average Fare value for the passengers that survived.
+
+```{r}
+combined_data[is.na(Fare),"Fare"]<- mean(combined_data[Survived==1]$Fare)
+```
+
+Now imputing missing data points for Age using variables Sex,Title,Fare as they seem to be correlated.
+
+```{r}
+# Use variables for imputing Age [variables most correlated with Age]
+combined_data_AgeCorr_vars <- c('Sex','Title','Fare','Age')
+# Set a random seed
+set.seed(129)
+
+# Perform mice imputation, excluding certain less-than-useful variables
+mice_mod <- mice(combined_data[,combined_data_AgeCorr_vars,with=FALSE], method='rf') 
+mice_output <- complete(mice_mod)
+
+# Noe creating Age group as a new variable
+combined_data_new<- combined_data
+combined_data_new$Age<- mice_output$Age
+combined_data_new[combined_data_new$Age <=18,"AgeGroup"] <- paste("Child")
+combined_data_new[combined_data_new$Age >18,"AgeGroup"]<- paste("Adult")
+
+```
+Now plotting distributions -
+  *First* - Age before and after Imputation
+```{r}
+p_before_imputation <- ggplot(combined_data, aes(x = Age, y= Pclass, group = Pclass,
+                                                 fill=factor(Pclass))) + geom_density_ridges2(alpha=0.5)
+
+p_after_imputation <- ggplot(combined_data_new, aes(x = Age, y= Pclass, group = Pclass,
+                                                    fill=factor(Pclass))) + geom_density_ridges2(alpha=0.5)
+plot_grid(p_before_imputation, p_after_imputation, nrow=1, labels=c('Before Imputation', 'After Imputation'))
+
+# Histogram of Family size grouped using Survival status and Pclass
+p_survival_hist<- ggplot(combined_data_new[!is.na(Survived)], aes(x = Fsize,fill=factor(Survived))) +
+  geom_bar(alpha=0.5,stat = 'count')+
+  scale_x_continuous(breaks=c(1:max(combined_data_new$Fsize)))
+
+p_Pclass_hist<- ggplot(combined_data_new, aes(x = Fsize,fill=factor(Pclass))) +
+  geom_bar(alpha=0.5,stat = 'count')+
+  scale_x_continuous(breaks=c(1:max(combined_data_new$Fsize)))
+
+plot_grid(p_survival_hist, p_Pclass_hist, nrow=1, labels=c('Family Size and Survival', 'Family Size and Pclass'))
+
+# Histogram of Survival status grouped using Pclass and AgeGroup
+p_survival_Pclass_hist<- ggplot(combined_data_new[!is.na(Survived)], aes(x = Pclass,
+                                                fill=factor(Survived)))+
+  geom_bar(alpha=0.5,stat = "count")
+
+p_survival_Age_hist<-ggplot(combined_data_new[!is.na(Survived)], aes(x = AgeGroup,
+                              fill=factor(Survived))) + geom_bar(alpha=0.5,stat = "count")
+
+
+plot_grid(p_survival_Pclass_hist, p_survival_Age_hist, nrow=1, labels=c('Survival across Pclass', 'Survival Across AgeGroups'))
+
+combined_data$Title<- gsub("\\..*","",gsub(".*\\,","",combined_data$Name))
+p_survival_Age_Title<-ggplot(combined_data[!is.na(Survived)], aes(x = Title,
+                              fill=factor(Survived))) + geom_bar(alpha=0.5,stat = "count")
+
+print(p_survival_Age_Title)
+```
+
+# Machine learning
+blah blah 
+
+## Training model 
+
+```{r}
+## create training data table 
+combined_data_new$AgeGroup<- as.factor(combined_data_new$AgeGroup)
+combined_data_new$Age <- (combined_data_new$Age - min(combined_data_new$Age))/(max(combined_data_new$Age)- min(combined_data_new$Age))
+
+
+combined_data_new$Fare <- (combined_data_new$Fare - min(combined_data_new$Fare))/(max(combined_data_new$Fare)- min(combined_data_new$Fare))
+
+df_train <- combined_data_new[!is.na(Survived)] 
+
+# set response variable as factor
+df_train$Survived<- as.factor(df_train$Survived)
+
+## use all other columns (except for the name) as predictors
+predictors <- setdiff(names(df_train), c("Survived", "Name","PassengerId")) 
+
+```
+
+
+```{r}
+splits <- h2o.splitFrame(
+  data = as.h2o(df_train), 
+  ratios = c(0.8),   ## only need to specify 2 fractions, the 3rd is implied
+  destination_frames = c("train.hex","test.hex"), seed = 1234
+)
+
+train <- splits[[1]]
+test  <- splits[[2]]
+
+
+
+```
+
+
+```{r}
+# Train & Cross-validate a GBM
+gbm <- h2o.gbm(x = predictors,
+               y = "Survived",
+               training_frame = train,
+               distribution = "bernoulli",
+               ntrees = 1000,
+               max_depth = 4,
+               min_rows = 2,
+               learn_rate = 0.2,
+               nfolds = 10,
+               fold_assignment = "Modulo",
+               keep_cross_validation_predictions = TRUE,
+               seed = 1)
+
+# Train & Cross-validate a RF
+rf <- h2o.randomForest(x = predictors,
+                       y = "Survived",
+                       training_frame = train,
+                       ntrees = 1000,
+                       nfolds = 10,
+                       fold_assignment = "Modulo",
+                       keep_cross_validation_predictions = TRUE,
+                       seed = 1)
+
+# Train a stacked ensemble using the GBM and RF above
+ensemble <- h2o.stackedEnsemble(x = predictors,
+                                y = "Survived",
+                                training_frame = train,
+                                model_id = "my_ensemble_binomial",
+                                base_models = list(gbm, rf))
+
+# Eval ensemble performance on a test set
+perf <- h2o.performance(ensemble, newdata = test)
+
+# Compare to base learner performance on the test set
+perf_gbm_test <- h2o.performance(gbm, newdata = test)
+perf_rf_test <- h2o.performance(rf, newdata = test)
+baselearner_best_auc_test <- max(h2o.auc(perf_gbm_test), h2o.auc(perf_rf_test))
+ensemble_auc_test <- h2o.auc(perf)
+print(sprintf("Best Base-learner Test AUC:  %s", baselearner_best_auc_test))
+print(sprintf("Ensemble Test AUC:  %s", ensemble_auc_test))
+
+# Eval ensemble performance on a test set
+perf <- h2o.performance(ensemble, newdata = test)
+
+# Compare to base learner performance on the test set
+perf_gbm_test <- h2o.performance(gbm, newdata = test)
+perf_rf_test <- h2o.performance(rf, newdata = test)
+baselearner_best_auc_test <- max(h2o.auc(perf_gbm_test), h2o.auc(perf_rf_test))
+ensemble_auc_test <- h2o.auc(perf)
+print(sprintf("Best Base-learner Test AUC:  %s", baselearner_best_auc_test))
+print(sprintf("Ensemble Test AUC:  %s", ensemble_auc_test))
+
+
+perf_table<- data.table(perf@metrics$thresholds_and_metric_scores)
+ggplot(perf_table,aes(x = fpr,y=tpr))+geom_point()+
+  stat_smooth(method = "loess",span = 0.45)+
+  geom_text(aes(x = 0.75, y = 0.5, label = paste("Ensemble Test AUC\n",round(ensemble_auc_test,2))),size = 8)
+
+```
+
+```{r}
+# Generate predictions on a test set
+df_test <- combined_data_new[is.na(Survived)] 
+df_test$Survived<- as.factor(df_test$Survived)
+pred <- as.data.table(h2o.predict(ensemble, newdata = as.h2o(df_test)))
+pred$PredClass<- apply(pred,1,function(x) {which.max(x)})
+pred$PredClass<- ifelse(pred$PredClass==1,1,0)  
+pred$PassengerId<- test_df$PassengerId
+pred$Survived<- pred$PredClass
+
+data_leader<- fread("submission_leaderboard.csv",sep=",")
+dat<- merge(pred,data_leader,by="PassengerId")
+cor(dat$Survived.x,dat$Survived.y)
+fwrite(pred[,c("PassengerId","Survived"),with=FALSE],"prediction_submission_03_ViM.csv",sep = ",")
+```
+
+
+
+
